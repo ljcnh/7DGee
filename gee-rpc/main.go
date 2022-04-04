@@ -1,130 +1,114 @@
-/**
- * @Author: lj
- * @Description:
- * @File:  main
- * @Version: 1.0.0
- * @Date: 2022/03/18 10:46
- */
-
 package main
 
 import (
-	"fmt"
+	"context"
+	"geerpc"
+	"geerpc/registry"
+	"geerpc/xclient"
+	"log"
+	"net"
+	"net/http"
+	"sync"
 	"time"
 )
 
+type Foo int
+
+type Args struct{ Num1, Num2 int }
+
+func (f Foo) Sum(args Args, reply *int) error {
+	*reply = args.Num1 + args.Num2
+	return nil
+}
+
+func (f Foo) Sleep(args Args, reply *int) error {
+	time.Sleep(time.Second * time.Duration(args.Num1))
+	*reply = args.Num1 + args.Num2
+	return nil
+}
+
+func startRegistry(wg *sync.WaitGroup) {
+	l, _ := net.Listen("tcp", ":9999")
+	registry.HandleHTTP()
+	wg.Done()
+	_ = http.Serve(l, nil)
+}
+
+func startServer(registryAddr string, wg *sync.WaitGroup) {
+	var foo Foo
+	l, _ := net.Listen("tcp", ":0")
+	server := geerpc.NewServer()
+	_ = server.Register(&foo)
+	registry.Heartbeat(registryAddr, "tcp@"+l.Addr().String(), 0)
+	wg.Done()
+	server.Accept(l)
+}
+
+func foo(xc *xclient.XClient, ctx context.Context, typ, serviceMethod string, args *Args) {
+	var reply int
+	var err error
+	switch typ {
+	case "call":
+		err = xc.Call(ctx, serviceMethod, args, &reply)
+	case "broadcast":
+		err = xc.Broadcast(ctx, serviceMethod, args, &reply)
+	}
+	if err != nil {
+		log.Printf("%s %s error: %v", typ, serviceMethod, err)
+	} else {
+		log.Printf("%s %s success: %d + %d = %d", typ, serviceMethod, args.Num1, args.Num2, reply)
+	}
+}
+
+func call(registry string) {
+	d := xclient.NewGeeRegistryDiscovery(registry, 0)
+	xc := xclient.NewXClient(d, xclient.RandomSelect, nil)
+	defer func() { _ = xc.Close() }()
+	// send request & receive response
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			foo(xc, context.Background(), "call", "Foo.Sum", &Args{Num1: i, Num2: i * i})
+		}(i)
+	}
+	wg.Wait()
+}
+
+func broadcast(registry string) {
+	d := xclient.NewGeeRegistryDiscovery(registry, 0)
+	xc := xclient.NewXClient(d, xclient.RandomSelect, nil)
+	defer func() { _ = xc.Close() }()
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			foo(xc, context.Background(), "broadcast", "Foo.Sum", &Args{Num1: i, Num2: i * i})
+			// expect 2 - 5 timeout
+			ctx, _ := context.WithTimeout(context.Background(), time.Second*2)
+			foo(xc, ctx, "broadcast", "Foo.Sleep", &Args{Num1: i, Num2: i * i})
+		}(i)
+	}
+	wg.Wait()
+}
+
 func main() {
-	pool := New(4)
+	log.SetFlags(0)
+	registryAddr := "http://localhost:9999/_geerpc_/registry"
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go startRegistry(&wg)
+	wg.Wait()
 
-	for i := 0; i < 8; i++ {
-		pool.NewTask(func() {
-			time.Sleep(1 * time.Millisecond)
-			fmt.Println(time.Now())
-		})
-	}
+	time.Sleep(time.Second)
+	wg.Add(2)
+	go startServer(registryAddr, &wg)
+	go startServer(registryAddr, &wg)
+	wg.Wait()
 
-	// 保证所有的协程都执行完毕
-	time.Sleep(5 * time.Second)
+	time.Sleep(time.Second)
+	call(registryAddr)
+	broadcast(registryAddr)
 }
-
-type Pool struct {
-	work chan func()
-	sem  chan struct{}
-}
-
-func New(size int) *Pool {
-	return &Pool{
-		work: make(chan func()),
-		sem:  make(chan struct{}, size),
-	}
-}
-
-func (p *Pool) NewTask(task func()) {
-	select {
-	case p.work <- task:
-	case p.sem <- struct{}{}:
-		go p.worker(task)
-	}
-}
-
-func (p *Pool) worker(task func()) {
-	defer func() {
-		<-p.sem
-	}()
-	for {
-		task()
-		<-p.work
-	}
-}
-
-/*func main() {
-	wp := New(3, 50).Start()
-	lenth := 100
-	for i := 0; i < lenth; i++ {
-		wp.PushTaskFunc(func(args ...interface{}) {
-			fmt.Print(args[0].(int), " ")
-		}, i)
-	}
-	wp.Stop()
-}
-
-type TaskFunc func(args ...interface{})
-
-type Task struct {
-	f    TaskFunc
-	args []interface{}
-}
-
-type WorkPool struct {
-	pool        chan *Task
-	workerCount int
-
-	stopCtx        context.Context
-	stopCancelFunc context.CancelFunc
-	wg             sync.WaitGroup
-}
-
-func (t *Task) Execute() {
-	t.f(t.args...)
-}
-
-func New(workerCount, poolLen int) *WorkPool {
-	return &WorkPool{
-		pool:        make(chan *Task, poolLen),
-		workerCount: workerCount,
-	}
-}
-
-func (w *WorkPool) PushTask(t *Task) {
-	w.pool <- t
-}
-
-func (w *WorkPool) PushTaskFunc(f TaskFunc, args ...interface{}) {
-	w.pool <- &Task{f: f, args: args}
-}
-
-func (w *WorkPool) work() {
-	for {
-		select {
-		case <-w.stopCtx.Done():
-			w.wg.Done()
-		case t := <-w.pool:
-			t.Execute()
-		}
-	}
-}
-
-func (w *WorkPool) Start() *WorkPool {
-	w.wg.Add(w.workerCount)
-	w.stopCtx, w.stopCancelFunc = context.WithCancel(context.Background())
-	for i := 0; i < w.workerCount; i++ {
-		go w.work()
-	}
-	return w
-}
-
-func (w *WorkPool) Stop() {
-	w.stopCancelFunc()
-	w.wg.Wait()
-}
-*/
